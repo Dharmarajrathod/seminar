@@ -972,8 +972,7 @@ def render_map(filtered: pd.DataFrame):
                       radius_min_pixels=4, radius_max_pixels=12, pickable=True),
         ],
     )
-    map_html = deck.to_html(as_string=True)
-    components.html(map_html, height=560, scrolling=False)
+    render_deck_chart(deck, height=560)
 
 
 def filter_map_observations_for_phase(filtered: pd.DataFrame, phase_view: str) -> pd.DataFrame:
@@ -1061,6 +1060,9 @@ def main():
     if selected_zone_popup:
         render_zone_analysis_popup(
             base_df, selected_zone_popup, selected_zone_season)
+
+    st.write("Filtered Map Data:", map_filtered.head())
+    st.write("Filtered Map Columns:", map_filtered.columns)
 
     section_close()
 
