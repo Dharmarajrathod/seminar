@@ -706,6 +706,17 @@ def render_zone_selector_map(active_zone: Optional[str], active_season: str):
         st.session_state["selected_zone_popup"] = None
 
 
+def render_phase_filter(active_phase: str):
+    st.markdown("#### Select Display")
+    phase_cols = st.columns(3)
+    phase_options = ["Flowering", "Fruiting", "Both"]
+    for col, option in zip(phase_cols, phase_options):
+        with col:
+            if st.button(option, key=f"phase-filter-{option.lower()}"):
+                st.session_state["selected_phase_view"] = option
+    st.caption(f"Showing: {active_phase} observations with `Yes` status only.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  render_zone_analysis_popup
 #  Original UI (metrics + plotly charts) KEPT.
@@ -849,7 +860,11 @@ def render_zone_analysis_popup(base_df: pd.DataFrame, zone_name: str, season_lab
     linear_fig.update_layout(
         xaxis_title="Month", yaxis_title="Observations", hovermode="x unified"
     )
-    linear_fig.update_xaxes(tickformat="%b %Y", tickangle=-45)
+    linear_fig.update_xaxes(
+        tickformat="%b %Y",
+        tickangle=-45,
+        tickfont={"color": "#000000"},
+    )
     style_figure(linear_fig)
     st.plotly_chart(linear_fig, use_container_width=True)
 
@@ -865,6 +880,7 @@ def render_zone_analysis_popup(base_df: pd.DataFrame, zone_name: str, season_lab
     flowers_fig.update_layout(
         xaxis_title="Date", yaxis_title="Number of 'Yes' Counts")
     flowers_fig.update_xaxes(tickformat="%b %Y", tickangle=-45,
+                             tickfont={"color": "#000000"},
                              showgrid=True, gridcolor="rgba(58,42,28,0.12)")
     flowers_fig.update_yaxes(showgrid=True, gridcolor="rgba(58,42,28,0.12)")
     style_figure(flowers_fig)
@@ -879,6 +895,7 @@ def render_zone_analysis_popup(base_df: pd.DataFrame, zone_name: str, season_lab
     fruits_fig.update_layout(
         xaxis_title="Date", yaxis_title="Number of 'Yes' Counts")
     fruits_fig.update_xaxes(tickformat="%b %Y", tickangle=-45,
+                            tickfont={"color": "#000000"},
                             showgrid=True, gridcolor="rgba(58,42,28,0.12)")
     fruits_fig.update_yaxes(showgrid=True, gridcolor="rgba(58,42,28,0.12)")
     style_figure(fruits_fig)
@@ -959,6 +976,15 @@ def render_map(filtered: pd.DataFrame):
     components.html(map_html, height=560, scrolling=False)
 
 
+def filter_map_observations_for_phase(filtered: pd.DataFrame, phase_view: str) -> pd.DataFrame:
+    yes_only = filtered[filtered["Observation_Status"] == "Yes"].copy()
+    if phase_view == "Flowering":
+        return yes_only[yes_only["Phenophase"] == "Flowers"].copy()
+    if phase_view == "Fruiting":
+        return yes_only[yes_only["Phenophase"] == "Fruits"].copy()
+    return yes_only[yes_only["Phenophase"].isin(["Flowers", "Fruits"])].copy()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  main  (original — unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1005,9 +1031,12 @@ def main():
         st.session_state["selected_zone_popup"] = None
     if "selected_zone_season" not in st.session_state:
         st.session_state["selected_zone_season"] = ZONE_ANALYSIS_SEASONS[0]
+    if "selected_phase_view" not in st.session_state:
+        st.session_state["selected_phase_view"] = "Both"
 
     selected_zone_popup = st.session_state["selected_zone_popup"]
     selected_zone_season = st.session_state["selected_zone_season"]
+    selected_phase_view = st.session_state["selected_phase_view"]
 
     section_open("Spatial View", "Interactive Map")
 
@@ -1017,13 +1046,17 @@ def main():
     if selected_zone_popup:
         map_filtered = map_filtered[map_filtered["Location_Zone"]
                                     == selected_zone_popup]
+    map_filtered = filter_map_observations_for_phase(
+        map_filtered, selected_phase_view)
 
     render_map(map_filtered)
+    render_phase_filter(selected_phase_view)
     render_zone_selector_map(selected_zone_popup, selected_zone_season)
 
     # re-read after widgets may have changed session state
     selected_zone_popup = st.session_state["selected_zone_popup"]
     selected_zone_season = st.session_state["selected_zone_season"]
+    selected_phase_view = st.session_state["selected_phase_view"]
 
     if selected_zone_popup:
         render_zone_analysis_popup(
