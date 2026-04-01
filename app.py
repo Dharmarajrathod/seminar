@@ -941,38 +941,60 @@ def render_deck_chart(deck: pdk.Deck, height: int = 500):
 
 
 def render_map(filtered: pd.DataFrame):
-    scatter_data = filtered[[
-        "_Location_latitude", "_Location_longitude",
-        "Phenophase", "Phenophase_Color", "tooltip", "Location_Zone",
-    ]].copy()
-    scatter_data["color"] = scatter_data["Phenophase"].map({
-        "Leaves":  [42,  157, 143, 190],
-        "Flowers": [250, 204, 21,  190],
-        "Fruits":  [220, 38,  38,  190],
-    })
-    deck = pdk.Deck(
-        map_provider="carto",
-        map_style="light",
-        initial_view_state=pdk.ViewState(
-            latitude=MAP_CENTER["lat"], longitude=MAP_CENTER["lon"],
-            zoom=4.2, pitch=0,
-        ),
-        tooltip={"html": "{tooltip}"},
-        layers=[
-            pdk.Layer("PolygonLayer", data=build_zone_polygons(),
-                      get_polygon="polygon", get_fill_color="fill_color",
-                      get_line_color=[255, 255, 255, 0], stroked=False, filled=True,
-                      pickable=True, auto_highlight=True),
-            pdk.Layer("PathLayer", data=build_zone_lines(),
-                      get_path="path", get_color=[37, 99, 235, 180],
-                      width_scale=1, width_min_pixels=2, pickable=False),
-            pdk.Layer("ScatterplotLayer", data=scatter_data,
-                      get_position="[_Location_longitude, _Location_latitude]",
-                      get_fill_color="color", get_radius=18000,
-                      radius_min_pixels=4, radius_max_pixels=12, pickable=True),
-        ],
-    )
-    render_deck_chart(deck, height=560)
+    try:
+        # Ensure required columns exist
+        required_columns = [
+            "_Location_latitude", "_Location_longitude",
+            "Phenophase", "Phenophase_Color", "tooltip", "Location_Zone",
+        ]
+        for col in required_columns:
+            if col not in filtered.columns:
+                raise ValueError(f"Missing required column: {col}")
+
+        # Drop rows with missing latitude or longitude
+        scatter_data = filtered.dropna(
+            subset=["_Location_latitude", "_Location_longitude"]).copy()
+
+        # Map colors for Phenophase
+        scatter_data["color"] = scatter_data["Phenophase"].map({
+            "Leaves":  [42,  157, 143, 190],
+            "Flowers": [250, 204, 21,  190],
+            "Fruits":  [220, 38,  38,  190],
+        })
+
+        # Create the pydeck.Deck object
+        deck = pdk.Deck(
+            map_provider="carto",
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=MAP_CENTER["lat"], longitude=MAP_CENTER["lon"],
+                zoom=4.2, pitch=0,
+            ),
+            tooltip={"html": "{tooltip}"},
+            layers=[
+                pdk.Layer("PolygonLayer", data=build_zone_polygons(),
+                          get_polygon="polygon", get_fill_color="fill_color",
+                          get_line_color=[255, 255, 255, 0], stroked=False, filled=True,
+                          pickable=True, auto_highlight=True),
+                pdk.Layer("PathLayer", data=build_zone_lines(),
+                          get_path="path", get_color=[37, 99, 235, 180],
+                          width_scale=1, width_min_pixels=2, pickable=False),
+                pdk.Layer("ScatterplotLayer", data=scatter_data,
+                          get_position="[_Location_longitude, _Location_latitude]",
+                          get_fill_color="color", get_radius=18000,
+                          radius_min_pixels=4, radius_max_pixels=12, pickable=True),
+            ],
+        )
+
+        # Render the map
+        render_deck_chart(deck, height=560)
+
+    except Exception as e:
+        # Log the error and data for debugging
+        st.error(f"Error rendering map: {e}")
+        st.write("Filtered Data:", filtered.head())
+        st.write("Scatter Data:", scatter_data.head()
+                 if 'scatter_data' in locals() else "N/A")
 
 
 def filter_map_observations_for_phase(filtered: pd.DataFrame, phase_view: str) -> pd.DataFrame:
