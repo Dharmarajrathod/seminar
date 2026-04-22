@@ -498,12 +498,24 @@ def inject_styles():
         [data-testid="stSidebar"] [role="radiogroup"] label * {
             background: transparent !important; box-shadow: none !important;
         }
-        [data-testid="stSidebar"] .stMarkdown p { color: #6f5235; }
+        [data-testid="stSidebar"],
+        [data-testid="stSidebar"] *,
+        [data-testid="stSidebar"] .stMarkdown p,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] label p,
+        [data-testid="stSidebar"] label span,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] [data-testid="stCheckbox"] p,
+        [data-testid="stSidebar"] [data-testid="stCheckbox"] span {
+            color: #000000 !important;
+            -webkit-text-fill-color: #000000 !important;
+        }
         [data-testid="stSidebar"] .stRadio label p,
         [data-testid="stSidebar"] .stRadio > label,
         [data-testid="stSidebar"] .stRadio > div > label,
         [data-testid="stSidebar"] div[data-testid="stWidgetLabel"] p {
-            color: #ffffff !important; -webkit-text-fill-color: #ffffff !important;
+            color: #000000 !important; -webkit-text-fill-color: #000000 !important;
         }
         [data-testid="stMetric"] {
             background: rgba(255,251,244,0.88);
