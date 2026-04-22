@@ -1,10 +1,14 @@
 import calendar
+import json
 import re
 import io
+import os
 from zipfile import ZipFile
 from datetime import date
 from pathlib import Path
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 
 import folium
@@ -24,8 +28,13 @@ st.set_page_config(
 )
 
 
-DATA_PATH = Path(__file__).resolve().parent / "data.csv"
 DATA2_PATH = Path(__file__).resolve().parent / "data2.csv"
+KOBO_BASE_URL = "https://eu.kobotoolbox.org"
+KOBO_ASSET_UID = os.getenv("KOBO_ASSET_UID", "a4fnScVYw99a9fUv4kL48W")
+KOBO_API_TOKEN = os.getenv(
+    "KOBO_API_TOKEN",
+    "67d9b9b9c5276d1dd7cf717573df7ae1598468e1",
+)
 MAP_CENTER = {"lat": 22, "lon": 78}
 ZONE_BINS = [4, 8, 12, 16, 20, 24, 28, 32, 36]
 ZONE_LABELS = [
@@ -99,12 +108,12 @@ def st_image(buf):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  load_data  (original — unchanged)
+#  data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-@cache_data
-def load_data(path: Path):
-    df = pd.read_csv(path)
+
+def preprocess_data(df: pd.DataFrame):
+    df = harmonize_kobo_columns(df.copy())
 
     df["_Location_latitude"] = pd.to_numeric(
         df["_Location_latitude"],  errors="coerce")
@@ -204,6 +213,190 @@ def load_data(path: Path):
         ), axis=1,
     )
     return df, observations
+
+
+def harmonize_kobo_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_candidates = {
+        "Select the Observation type": [
+            "Select_the_Observation_type",
+        ],
+        "Details of the Tree/Leaves": [
+            "Details_of_the_Tree/Leave_Sprouting",
+            "Leaves",
+        ],
+        "Details of the Tree/Flowers": [
+            "Details_of_the_Tree/Flowering",
+            "Flowers",
+        ],
+        "Details of the Tree/Fruits": [
+            "Details_of_the_Tree/Fruiting",
+            "Fruits",
+        ],
+        "Location_of_Observation": [
+            "Location_of_Observation",
+            "Location_of_Observation_001",
+        ],
+        "Location": [
+            "Location",
+            "Mark_the_location_of_your_Observation",
+            "Mark_your_Location_of_Observation",
+        ],
+        "Time": [
+            "Time",
+            "Enter_the_date_and_time_of_observation",
+        ],
+        "Name of Reporter": [
+            "Name_of_the_Reporter",
+        ],
+    }
+
+    rename_map = {}
+    for target, candidates in rename_candidates.items():
+        if target in df.columns:
+            continue
+        for candidate in candidates:
+            if candidate in df.columns:
+                rename_map[candidate] = target
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "_Location_latitude" not in df.columns or "_Location_longitude" not in df.columns:
+        lat_series, lon_series = extract_geolocation_columns(df)
+        if "_Location_latitude" not in df.columns:
+            df["_Location_latitude"] = lat_series
+        if "_Location_longitude" not in df.columns:
+            df["_Location_longitude"] = lon_series
+
+    required_defaults = {
+        "Select the Observation type": pd.NA,
+        "Details of the Tree/Leaves": pd.NA,
+        "Details of the Tree/Flowers": pd.NA,
+        "Details of the Tree/Fruits": pd.NA,
+        "Location_of_Observation": pd.NA,
+        "Location": pd.NA,
+        "Time": pd.NA,
+        "start": pd.NA,
+        "today": pd.NA,
+        "_submission_time": pd.NA,
+    }
+    for column_name, default_value in required_defaults.items():
+        if column_name not in df.columns:
+            df[column_name] = default_value
+
+    return df
+
+
+def extract_geolocation_columns(df: pd.DataFrame):
+    def coerce_list(value):
+        if isinstance(value, list) and len(value) >= 2:
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list) and len(parsed) >= 2:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            parts = stripped.replace(",", " ").split()
+            if len(parts) >= 2:
+                return parts
+        return [pd.NA, pd.NA]
+
+    geolocation_sources = [
+        "_geolocation",
+        "Location",
+        "Mark_the_location_of_your_Observation",
+        "Mark_your_Location_of_Observation",
+    ]
+    for source in geolocation_sources:
+        if source in df.columns:
+            parsed = df[source].apply(coerce_list)
+            lat_series = pd.to_numeric(parsed.str[0], errors="coerce")
+            lon_series = pd.to_numeric(parsed.str[1], errors="coerce")
+            if lat_series.notna().any() and lon_series.notna().any():
+                return lat_series, lon_series
+
+    lat_candidates = [
+        "_Location_latitude",
+        "_Mark_your_Location_of_Observation_latitude",
+        "_Mark_the_location_of_your_Observation_latitude",
+        "Location_latitude",
+    ]
+    lon_candidates = [
+        "_Location_longitude",
+        "_Mark_your_Location_of_Observation_longitude",
+        "_Mark_the_location_of_your_Observation_longitude",
+        "Location_longitude",
+    ]
+
+    lat_series = pd.Series(pd.NA, index=df.index, dtype="object")
+    lon_series = pd.Series(pd.NA, index=df.index, dtype="object")
+
+    for candidate in lat_candidates:
+        if candidate in df.columns:
+            lat_series = pd.to_numeric(df[candidate], errors="coerce")
+            break
+    for candidate in lon_candidates:
+        if candidate in df.columns:
+            lon_series = pd.to_numeric(df[candidate], errors="coerce")
+            break
+
+    return lat_series, lon_series
+
+
+def _kobo_request_json(url: str, api_token: str) -> dict:
+    request = Request(
+        url,
+        headers={"Authorization": f"Token {api_token}"},
+    )
+    with urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+@cache_data(show_spinner=False)
+def fetch_kobo_api_dataframe(base_url: str, asset_uid: str, api_token: str) -> pd.DataFrame:
+    next_url = f"{base_url}/api/v2/assets/{asset_uid}/data/?format=json&limit=2000"
+    records = []
+
+    while next_url:
+        payload = _kobo_request_json(next_url, api_token)
+        page_results = payload.get("results", [])
+        if not isinstance(page_results, list):
+            raise ValueError("Kobo data API returned an unexpected payload.")
+        records.extend(page_results)
+        next_url = payload.get("next")
+
+    if not records:
+        raise ValueError("Kobo data API returned no submissions.")
+
+    df = pd.json_normalize(records, sep="/")
+    return df
+
+
+@cache_data(show_spinner=False)
+def load_live_data(base_url: str, asset_uid: str, api_token: str):
+    df = fetch_kobo_api_dataframe(base_url, asset_uid, api_token)
+    return preprocess_data(df)
+
+
+def load_primary_dataset():
+    if not KOBO_API_TOKEN:
+        raise RuntimeError("KOBO_API_TOKEN is not configured.")
+
+    try:
+        base_df, observations = load_live_data(
+            KOBO_BASE_URL, KOBO_ASSET_UID, KOBO_API_TOKEN
+        )
+        return base_df, observations, "Live Kobo API"
+    except (HTTPError, URLError, TimeoutError, ValueError, pd.errors.ParserError) as exc:
+        raise RuntimeError(
+            f"Kobo API fetch failed: {type(exc).__name__}: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Kobo API fetch failed: {type(exc).__name__}: {exc}") from exc
 
 
 def normalize_status(series: pd.Series) -> pd.Series:
@@ -420,17 +613,54 @@ def style_figure(fig):
     return fig
 
 
+def checkbox_filter(label: str, options: list[str], key_prefix: str) -> list[str]:
+    st.markdown(f"#### {label}")
+    selected = []
+    for option in options:
+        key = f"{key_prefix}-{re.sub(r'[^a-zA-Z0-9]+', '-', str(option)).strip('-')}"
+        if st.checkbox(str(option), value=True, key=key):
+            selected.append(option)
+    return selected
+
+
 def apply_filters(data: pd.DataFrame, view_mode: str):
     filtered = data.copy()
+
+    with st.sidebar:
+        st.markdown("## Filters")
+
+        zone_options = [
+            zone for zone in ZONE_LABELS if zone in filtered["Location_Zone"].dropna().astype(str).unique()
+        ]
+        selected_zones = checkbox_filter("Zones", zone_options, "filter-zone")
+
+        season_values = [
+            season for season in filtered["Season_Label"].dropna().astype(str).unique().tolist()
+        ]
+        selected_seasons = checkbox_filter("Seasons", sorted(
+            season_values,
+            key=lambda value: int(value.split("-")[0]) if "-" in value else 0,
+        ), "filter-season")
+
+        selected_phases = checkbox_filter(
+            "Phenophases", list(PHASE_COLORS.keys()), "filter-phase")
+        selected_statuses = checkbox_filter(
+            "Statuses", STATUS_ORDER, "filter-status")
+
     normal_context_df = filtered.copy()
-    normal_filtered = normal_context_df.copy()
-    selected_zone = "All Zones"
-    selected_season = "All Seasons"
+    filtered = filtered[filtered["Location_Zone"].astype(str).isin(selected_zones)]
+    filtered = filtered[filtered["Season_Label"].astype(str).isin(selected_seasons)]
+    filtered = filtered[filtered["Phenophase"].isin(selected_phases)]
+    filtered = filtered[filtered["Observation_Status"].astype(str).isin(selected_statuses)]
+
+    normal_filtered = filtered.copy()
     seasonal_filtered = filtered.copy()
     return {
         "view_mode":         view_mode,
-        "selected_zone":     selected_zone,
-        "selected_season":   selected_season,
+        "selected_zones":    selected_zones,
+        "selected_seasons":  selected_seasons,
+        "selected_phases":   selected_phases,
+        "selected_statuses": selected_statuses,
         "normal_context_df": normal_context_df,
         "normal_filtered":   normal_filtered,
         "seasonal_filtered": seasonal_filtered,
@@ -544,6 +774,109 @@ def build_melted_df_for_zone(path: Path, zone_name: str, season_label: str) -> p
         melted_df["Detail Type"]
         .str.replace("Details of the Tree/", "", regex=False)
         .str.replace(" (Yes)", "",             regex=False)
+    )
+    return melted_df
+
+
+@cache_data
+def build_melted_df_for_zone_df(base_df: pd.DataFrame, zone_name: str, season_label: str) -> pd.DataFrame:
+    csv_buffer = io.StringIO()
+    base_df.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+    temp_df = pd.read_csv(csv_buffer)
+    return preprocess_zone_melt(temp_df, zone_name, season_label)
+
+
+def preprocess_zone_melt(df: pd.DataFrame, zone_name: str, season_label: str) -> pd.DataFrame:
+    df["_Location_latitude"] = pd.to_numeric(
+        df["_Location_latitude"], errors="coerce"
+    )
+    df["_Location_longitude"] = pd.to_numeric(
+        df["_Location_longitude"], errors="coerce"
+    )
+
+    df["Location_Zone"] = pd.cut(
+        df["_Location_latitude"],
+        bins=NB_BINS, labels=NB_LABELS,
+        right=True, include_lowest=True,
+    )
+    df.dropna(subset=["_Location_latitude",
+              "_Location_longitude"], inplace=True)
+    df = df[
+        (df["_Location_latitude"] >= ANALYSIS_MIN_LATITUDE) &
+        (df["_Location_latitude"] <= ANALYSIS_MAX_LATITUDE) &
+        (df["_Location_longitude"] >= ANALYSIS_MIN_LONGITUDE) &
+        (df["_Location_longitude"] <= ANALYSIS_MAX_LONGITUDE)
+    ].copy()
+
+    df["start"] = pd.to_datetime(df["start"], errors="coerce", utc=True)
+    if df["start"].dt.tz is not None:
+        df["start"] = df["start"].dt.tz_localize(None)
+
+    sy, ey = map(int, season_label.split("-"))
+    start_date = date(sy, 8, 1)
+    end_date = date(ey, 7, 31)
+
+    columns_to_analyze = [
+        "Details of the Tree/Leaves",
+        "Details of the Tree/Flowers",
+        "Details of the Tree/Fruits",
+    ]
+    results_list = []
+    current_month_year = start_date
+
+    while current_month_year <= end_date:
+        month_num = current_month_year.month
+        year_num = current_month_year.year
+        month_name = calendar.month_name[month_num]
+
+        monthly_data = df[
+            (df["start"].dt.month == month_num) &
+            (df["start"].dt.year == year_num)
+        ]
+        monthly_zone_data = monthly_data[monthly_data["Location_Zone"] == zone_name]
+
+        counts_dict = {
+            "Month": month_name,
+            "Year": year_num,
+            "Location_Zone": zone_name,
+            "Total Entries": monthly_zone_data.shape[0],
+        }
+        for col in columns_to_analyze:
+            yes_count = (
+                monthly_zone_data[col].value_counts().get("Yes", 0)
+                if col in monthly_zone_data.columns else 0
+            )
+            counts_dict[f"{col} (Yes)"] = yes_count
+        results_list.append(counts_dict)
+
+        current_month_year = (
+            date(year_num + 1, 1, 1) if month_num == 12
+            else date(year_num, month_num + 1, 1)
+        )
+
+    monthly_zone_counts_df = pd.DataFrame(results_list)
+    monthly_zone_counts_df["Date"] = monthly_zone_counts_df.apply(
+        lambda row: pd.to_datetime(f"{row['Year']}-{row['Month']}-01"), axis=1
+    )
+    monthly_zone_counts_df = monthly_zone_counts_df.sort_values(
+        by=["Date", "Location_Zone"]
+    ).reset_index(drop=True)
+
+    melted_df = monthly_zone_counts_df.melt(
+        id_vars=["Date", "Month", "Year", "Location_Zone", "Total Entries"],
+        value_vars=[
+            "Details of the Tree/Leaves (Yes)",
+            "Details of the Tree/Flowers (Yes)",
+            "Details of the Tree/Fruits (Yes)",
+        ],
+        var_name="Detail Type",
+        value_name="Yes Count",
+    )
+    melted_df["Detail Type"] = (
+        melted_df["Detail Type"]
+        .str.replace("Details of the Tree/", "", regex=False)
+        .str.replace(" (Yes)", "", regex=False)
     )
     return melted_df
 
@@ -669,43 +1002,6 @@ def load_data2_workbook(path: Path) -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  render_zone_selector_map  (original — unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def render_zone_selector_map(active_zone: Optional[str], active_season: str):
-    st.markdown("#### Select Season")
-    st.selectbox(
-        "Seasonal Option",
-        ZONE_ANALYSIS_SEASONS,
-        index=ZONE_ANALYSIS_SEASONS.index(active_season)
-        if active_season in ZONE_ANALYSIS_SEASONS else 0,
-        key="selected_zone_season",
-    )
-
-    st.markdown("#### Select Zone")
-    if active_zone:
-        st.markdown(
-            f'<div class="zone-button-label">Active: {active_zone}</div>',
-            unsafe_allow_html=True,
-        )
-    st.caption(
-        f"Click a zone to open its flower and fruit analysis for "
-        f"{st.session_state['selected_zone_season']}."
-    )
-
-    first_row = st.columns(4)
-    second_row = st.columns(4)
-    for index, zone_name in enumerate(ZONE_LABELS):
-        target_col = first_row[index] if index < 4 else second_row[index - 4]
-        with target_col:
-            if st.button(zone_name, key=f"zone-select-{zone_name}"):
-                st.session_state["selected_zone_popup"] = zone_name
-
-    if active_zone and st.button("Clear Selection", key="zone-clear"):
-        st.session_state["selected_zone_popup"] = None
-
-
 def render_phase_filter(active_phase: str):
     st.markdown("#### Select Display")
     phase_cols = st.columns(3)
@@ -723,71 +1019,21 @@ def render_phase_filter(active_phase: str):
 #  Notebook matplotlib charts APPENDED below them.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_monthly_zone_data2(zone_name: str, season_label: str) -> pd.DataFrame:
-    df = load_data2_workbook(DATA2_PATH).copy()
-    df["_Location_latitude"] = pd.to_numeric(
-        df["_Location_latitude"],  errors="coerce")
-    df["_Location_longitude"] = pd.to_numeric(
-        df["_Location_longitude"], errors="coerce")
-    df["Location_Zone"] = pd.cut(
-        df["_Location_latitude"],
-        bins=ANALYSIS_ZONE_BINS, labels=ZONE_LABELS,
-        right=True, include_lowest=True,
+def build_monthly_zone_data2(base_df: pd.DataFrame, zone_name: str, season_label: str) -> pd.DataFrame:
+    melted_df = build_melted_df_for_zone_df(base_df, zone_name, season_label)
+    flower_df = (
+        melted_df[melted_df["Detail Type"] == "Flowers"]
+        .rename(columns={"Yes Count": "Flowers Yes"})
+        [["Date", "Month", "Year", "Location_Zone", "Total Entries", "Flowers Yes"]]
     )
-    df.dropna(subset=["_Location_latitude",
-              "_Location_longitude"], inplace=True)
-    df = df[
-        (df["_Location_latitude"] >= ANALYSIS_MIN_LATITUDE) &
-        (df["_Location_latitude"] <= ANALYSIS_MAX_LATITUDE) &
-        (df["_Location_longitude"] >= ANALYSIS_MIN_LONGITUDE) &
-        (df["_Location_longitude"] <= ANALYSIS_MAX_LONGITUDE)
-    ].copy()
-    df["start"] = pd.to_datetime(df["start"], errors="coerce")
-
-    season_start_year, season_end_year = map(int, season_label.split("-"))
-    start_date = date(season_start_year, 8, 1)
-    end_date = date(season_end_year,   7, 31)
-
-    results_list = []
-    current_month_year = start_date
-    columns_to_analyze = ["Leaves", "Flowers", "Fruits"]
-
-    while current_month_year <= end_date:
-        month_num = current_month_year.month
-        year_num = current_month_year.year
-        month_name = calendar.month_name[month_num]
-
-        monthly_data = df[
-            (df["start"].dt.month == month_num) &
-            (df["start"].dt.year == year_num) &
-            (df["Location_Zone"] == zone_name)
-        ]
-        counts_dict = {
-            "Month Label":   month_name,
-            "Year":          year_num,
-            "Location_Zone": zone_name,
-            "Total Entries": monthly_data.shape[0],
-        }
-        for col in columns_to_analyze:
-            yes_count = monthly_data[col].value_counts().get(
-                "Yes", 0) if col in monthly_data.columns else 0
-            counts_dict[f"{col} (Yes)"] = yes_count
-        results_list.append(counts_dict)
-
-        current_month_year = (
-            date(year_num + 1, 1, 1) if month_num == 12
-            else date(year_num, month_num + 1, 1)
-        )
-
-    monthly_zone_counts_df = pd.DataFrame(results_list)
-    monthly_zone_counts_df["Date"] = monthly_zone_counts_df.apply(
-        lambda row: pd.to_datetime(f"{row['Year']}-{row['Month Label']}-01"), axis=1
+    fruit_df = (
+        melted_df[melted_df["Detail Type"] == "Fruits"]
+        .rename(columns={"Yes Count": "Fruits Yes"})
+        [["Date", "Fruits Yes"]]
     )
-    monthly_zone_counts_df = monthly_zone_counts_df.sort_values(
-        "Date").reset_index(drop=True)
+    monthly_zone_counts_df = flower_df.merge(fruit_df, on="Date", how="left")
+    monthly_zone_counts_df["Month Label"] = monthly_zone_counts_df["Month"]
     monthly_zone_counts_df["Month"] = monthly_zone_counts_df["Date"]
-    monthly_zone_counts_df["Flowers Yes"] = monthly_zone_counts_df["Flowers (Yes)"]
-    monthly_zone_counts_df["Fruits Yes"] = monthly_zone_counts_df["Fruits (Yes)"]
     return monthly_zone_counts_df[[
         "Date", "Month Label", "Year", "Location_Zone",
         "Total Entries", "Flowers Yes", "Fruits Yes", "Month",
@@ -801,9 +1047,164 @@ def render_dataframe(df: pd.DataFrame):
         st.dataframe(df)
 
 
+def render_kobo_data_preview(raw_df: pd.DataFrame, processed_df: pd.DataFrame):
+    section_open("API Data", "Fetched Kobo Records")
+    st.caption(
+        f"Raw submissions fetched from Kobo API: {len(raw_df):,} rows. "
+        f"Filtered processed observations: {len(processed_df):,} rows."
+    )
+
+    with st.expander("Raw Kobo API data", expanded=False):
+        st.caption(f"Showing all {len(raw_df):,} raw rows.")
+        render_dataframe(raw_df)
+
+    with st.expander("Filtered processed data used by charts", expanded=False):
+        st.caption(f"Showing all {len(processed_df):,} processed rows.")
+        render_dataframe(processed_df)
+
+    section_close()
+
+
+def selected_season_window(season_label: str):
+    season_start_year, season_end_year = map(int, season_label.split("-"))
+    return date(season_start_year, 8, 1), date(season_end_year, 7, 31)
+
+
+def build_filtered_monthly_counts(
+    filtered_observations: pd.DataFrame,
+    zone_name: str,
+    season_label: str,
+) -> pd.DataFrame:
+    start_date, end_date = selected_season_window(season_label)
+    chart_df = filtered_observations[
+        (filtered_observations["Location_Zone"].astype(str) == zone_name) &
+        (filtered_observations["Season_Label"].astype(str) == season_label)
+    ].copy()
+
+    results = []
+    current_month_year = start_date
+    selected_phases = [
+        phase for phase in PHASE_COLORS
+        if phase in chart_df["Phenophase"].dropna().astype(str).unique()
+    ]
+
+    while current_month_year <= end_date:
+        month_num = current_month_year.month
+        year_num = current_month_year.year
+        month_name = calendar.month_name[month_num]
+        month_start = pd.to_datetime(f"{year_num}-{month_num}-01")
+        monthly_data = chart_df[
+            (chart_df["Observation_Date"].dt.month == month_num) &
+            (chart_df["Observation_Date"].dt.year == year_num)
+        ]
+
+        for phase in selected_phases:
+            phase_data = monthly_data[monthly_data["Phenophase"] == phase]
+            results.append({
+                "Date": month_start,
+                "Month": month_name,
+                "Year": year_num,
+                "Location_Zone": zone_name,
+                "Phenophase": phase,
+                "Count": int(phase_data.shape[0]),
+                "Total Entries": int(monthly_data.shape[0]),
+            })
+
+        current_month_year = (
+            date(year_num + 1, 1, 1) if month_num == 12
+            else date(year_num, month_num + 1, 1)
+        )
+
+    return pd.DataFrame(results)
+
+
+def render_filtered_monthly_charts(
+    filtered_observations: pd.DataFrame,
+    selected_zones: list[str],
+    selected_seasons: list[str],
+    selected_statuses: list[str],
+):
+    if filtered_observations.empty:
+        st.warning("No records match the selected sidebar filters.")
+        return
+
+    chart_df = filtered_observations.copy()
+    chart_df["Month_Date"] = chart_df["Observation_Date"].dt.to_period("M").dt.to_timestamp()
+    monthly_counts = (
+        chart_df
+        .groupby(["Month_Date", "Phenophase"], observed=True)
+        .size()
+        .reset_index(name="Count")
+        .rename(columns={"Month_Date": "Date"})
+        .sort_values(["Date", "Phenophase"])
+    )
+
+    status_label = ", ".join(selected_statuses)
+    zone_label = ", ".join(selected_zones) if selected_zones else "None"
+    season_label = ", ".join(selected_seasons) if selected_seasons else "None"
+    st.markdown("### Monthly filtered counts")
+    st.caption(
+        f"Counts are calculated from the sidebar-filtered Kobo data. "
+        f"Zones: {zone_label}. Seasons: {season_label}. "
+        f"Included statuses: {status_label}."
+    )
+
+    color_map = {
+        "Leaves": "#2a9d8f",
+        "Flowers": "#1d4ed8",
+        "Fruits": "#16a34a",
+    }
+
+    for phase in monthly_counts["Phenophase"].dropna().unique():
+        plot_df = monthly_counts[monthly_counts["Phenophase"] == phase].copy()
+        st.markdown(f"### Monthly counts for {phase}")
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sns.lineplot(
+            data=plot_df,
+            x="Date",
+            y="Count",
+            marker="o",
+            markersize=8,
+            linewidth=2.5,
+            color=color_map.get(phase, "#1d4ed8"),
+            ax=ax,
+        )
+        ax.set_title(
+            f"Monthly counts for {phase}",
+            fontsize=16,
+        )
+        ax.set_xlabel("Date", fontsize=12)
+        ax.set_ylabel("Number of filtered records", fontsize=12)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.grid(True, linestyle="--", alpha=0.6)
+        plt.xticks(rotation=45, ha="right")
+
+        for _, row in plot_df.iterrows():
+            ax.text(
+                x=row["Date"],
+                y=row["Count"],
+                s=f"{int(row['Count'])}",
+                color="black",
+                fontsize=9,
+                ha="center",
+                va="bottom",
+            )
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+        buf.seek(0)
+        st_image(buf)
+        plt.close(fig)
+
+    with st.expander("Monthly filtered counts table", expanded=False):
+        render_dataframe(monthly_counts)
+
+
 def render_zone_analysis_popup(base_df: pd.DataFrame, zone_name: str, season_label: str):
     # ── original plotly section (data2 workbook) ──────────────────────────────
-    monthwise_df = build_monthly_zone_data2(zone_name, season_label)
+    monthwise_df = build_monthly_zone_data2(base_df, zone_name, season_label)
     presented_df = monthwise_df[[
         "Date", "Month Label", "Year", "Total Entries",
         "Flowers Yes", "Fruits Yes", "Month",
@@ -828,7 +1229,6 @@ def render_zone_analysis_popup(base_df: pd.DataFrame, zone_name: str, season_lab
     with close_col:
         st.write("")
         if st.button("Close", key="zone-popup-close"):
-            st.session_state["selected_zone_popup"] = None
             st.markdown("</div>", unsafe_allow_html=True)
             return
 
@@ -1034,11 +1434,22 @@ def main():
         unsafe_allow_html=True,
     )
 
-    if not DATA_PATH.exists():
-        st.error(f"Dataset not found at {DATA_PATH}")
+    try:
+        raw_api_df = fetch_kobo_api_dataframe(
+            KOBO_BASE_URL, KOBO_ASSET_UID, KOBO_API_TOKEN
+        )
+        base_df, data, data_source_label = load_primary_dataset()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    except (HTTPError, URLError, TimeoutError, ValueError, pd.errors.ParserError) as exc:
+        st.error(f"Kobo API fetch failed: {type(exc).__name__}: {exc}")
+        return
+    except Exception as exc:
+        st.error(f"Kobo API fetch failed: {type(exc).__name__}: {exc}")
         return
 
-    base_df, data = load_data(DATA_PATH)
+    st.caption(f"Data source: {data_source_label}")
 
     if data.empty or base_df.empty:
         st.error("No usable flowering or fruiting records were found in the dataset.")
@@ -1047,43 +1458,28 @@ def main():
     filters = apply_filters(data, view_mode)
     normal_context_df = filters["normal_context_df"]
     normal_filtered = filters["normal_filtered"]
-
-    if "selected_zone_popup" not in st.session_state:
-        st.session_state["selected_zone_popup"] = None
-    if "selected_zone_season" not in st.session_state:
-        st.session_state["selected_zone_season"] = ZONE_ANALYSIS_SEASONS[0]
-    if "selected_phase_view" not in st.session_state:
-        st.session_state["selected_phase_view"] = "Both"
-
-    selected_zone_popup = st.session_state["selected_zone_popup"]
-    selected_zone_season = st.session_state["selected_zone_season"]
-    selected_phase_view = st.session_state["selected_phase_view"]
+    filtered_zones = filters["selected_zones"]
+    filtered_seasons = filters["selected_seasons"]
+    filtered_phases = filters["selected_phases"]
+    filtered_statuses = filters["selected_statuses"]
 
     section_open("Spatial View", "Interactive Map")
 
     map_filtered = normal_filtered.copy()
-    map_filtered = map_filtered[map_filtered["Season_Label"]
-                                == selected_zone_season]
-    if selected_zone_popup:
-        map_filtered = map_filtered[map_filtered["Location_Zone"]
-                                    == selected_zone_popup]
-    map_filtered = filter_map_observations_for_phase(
-        map_filtered, selected_phase_view)
 
     render_map(map_filtered)
-    render_phase_filter(selected_phase_view)
-    render_zone_selector_map(selected_zone_popup, selected_zone_season)
+    st.caption(
+        f"Sidebar filters applied: Zones = {', '.join(filtered_zones) or 'None'}, "
+        f"Seasons = {', '.join(filtered_seasons) or 'None'}, "
+        f"Phenophases = {', '.join(filtered_phases) or 'None'}, "
+        f"Statuses = {', '.join(filtered_statuses) or 'None'}."
+    )
 
-    # re-read after widgets may have changed session state
-    selected_zone_popup = st.session_state["selected_zone_popup"]
-    selected_zone_season = st.session_state["selected_zone_season"]
-    selected_phase_view = st.session_state["selected_phase_view"]
-
-    if selected_zone_popup:
-        render_zone_analysis_popup(
-            base_df, selected_zone_popup, selected_zone_season)
+    render_filtered_monthly_charts(
+        normal_filtered, filtered_zones, filtered_seasons, filtered_statuses)
 
     section_close()
+    render_kobo_data_preview(raw_api_df, normal_filtered)
 
 
 if __name__ == "__main__":
